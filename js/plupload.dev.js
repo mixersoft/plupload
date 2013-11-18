@@ -153,6 +153,15 @@ var plupload = {
 	 * @final
 	 */
 	DONE : 5,
+	
+	/**
+	 * File upload was SKIPPED, added for missing EXIF
+	 *
+	 * @property SKIPPED
+	 * @static
+	 * @final
+	 */
+	SKIPPED: 6,
 
 	// Error constants used by the Error event
 
@@ -254,6 +263,15 @@ var plupload = {
 	 * @final
 	 */
 	IMAGE_DIMENSIONS_ERROR : -702,
+	
+	/**
+	 * JPEG Image files may require a valid Exif tag. If missing, will throw this error.
+	 *
+	 * @property IMAGE_EXIF_MISSING_ERROR
+	 * @static
+	 * @final
+	 */
+	IMAGE_EXIF_MISSING_ERROR : -703,
 
 	/**
 	 * Mime type lookup table.
@@ -711,10 +729,13 @@ plupload.addFileFilter('prevent_duplicates', function(value, file, cb) {
 	@param {String} [settings.container] id of the DOM element to use as a container for uploader structures. Defaults to document.body.
 	@param {String|DOMElement} [settings.drop_element] id of the DOM element or DOM element itself to use as a drop zone for Drag-n-Drop.
 	@param {String} [settings.file_data_name="file"] Name for the file field in Multipart formated message.
+
 	@param {Object} [settings.filters={}] Set of file type filters.
 		@param {Array} [settings.filters.mime_types=[]] List of file types to accept, each one defined by title and list of extensions. `e.g. {title : "Image files", extensions : "jpg,jpeg,gif,png"}`. Dispatches `plupload.FILE_EXTENSION_ERROR`
 		@param {String|Number} [settings.filters.max_file_size=0] Maximum file size that the user can pick, in bytes. Optionally supports b, kb, mb, gb, tb suffixes. `e.g. "10mb" or "1gb"`. By default - not set. Dispatches `plupload.FILE_SIZE_ERROR`.
 		@param {Boolean} [settings.filters.prevent_duplicates=false] Do not let duplicates into the queue. Dispatches `plupload.FILE_DUPLICATE_ERROR`.
+		@param {Boolean} [settings.filters.require_exif=false] Skip JPG files without valid EXIF meta data. Dispatches `plupload.IMAGE_EXIF_MISSING_ERROR`.
+
 	@param {String} [settings.flash_swf_url] URL of the Flash swf.
 	@param {Object} [settings.headers] Custom headers to send with the upload. Hash of name/value pairs.
 	@param {Number} [settings.max_retries=0] How many times to retry the chunk or file, before triggering Error event.
@@ -730,6 +751,9 @@ plupload.addFileFilter('prevent_duplicates', function(value, file, cb) {
 	@param {String} [settings.runtimes="html5,flash,silverlight,html4"] Comma separated list of runtimes, that Plupload will try in turn, moving to the next if previous fails.
 	@param {String} [settings.silverlight_xap_url] URL of the Silverlight xap.
 	@param {Boolean} [settings.unique_names=false] If true will generate unique filenames for uploaded files.
+
+	@param {Number} [settings.files_added_chunksize=false] Limit the number of files added the UI adds in each iteration
+
 */
 plupload.Uploader = function(options) {
 	/**
@@ -899,7 +923,7 @@ plupload.Uploader = function(options) {
 				}
 			}
 
-			// All files are DONE or FAILED
+			// All files are DONE, FAILED, or SKIPPED
 			if (count == files.length) {
 				if (this.state !== plupload.STOPPED) {
 					this.state = plupload.STOPPED;
@@ -940,7 +964,7 @@ plupload.Uploader = function(options) {
 
 			if (file.status == plupload.DONE) {
 				total.uploaded++;
-			} else if (file.status == plupload.FAILED) {
+			} else if (file.status == plupload.FAILED || file.status == plupload.SKIPPED) {
 				total.failed++;
 			} else {
 				total.queued++;
@@ -1019,8 +1043,11 @@ plupload.Uploader = function(options) {
 				options[runtime] = settings[runtime];
 			}
 		});
-
+		
 		// initialize file pickers - there can be many
+		// add chunksize to options so html5 FileDrop can access
+		options.files_added_chunksize = settings.files_added_chunksize || false;
+
 		if (settings.browse_button) {
 			plupload.each(settings.browse_button, function(el) {
 				queue.push(function(cb) {
@@ -1123,14 +1150,22 @@ plupload.Uploader = function(options) {
 
 	function resizeImage(blob, params, cb) {
 		var img = new o.Image();
+		var hasExif = null;
 
 		try {
 			img.onload = function() {
-				img.downsize(params.width, params.height, params.crop, params.preserve_headers);
+				if (this.height > params.height || this.width > params.width) {
+					// but check size before actually calling downsize()
+					img.downsize(params.width, params.height, params.crop, params.preserve_headers);
+				} else {
+					img.onresize();
+				}
 			};
 
 			img.onresize = function() {
-				cb(this.getAsBlob(blob.type, params.quality));
+				if (this.type == "image/jpeg") hasExif = !!this.meta.exif; 
+				// should we pass Boolean or the exif object?
+				cb(this.getAsBlob(blob.type, params.quality), hasExif);
 				this.destroy();
 			};
 
@@ -1172,7 +1207,7 @@ plupload.Uploader = function(options) {
 
 					if (init) {
 						plupload.extend(settings.filters, value);
-					} else {
+console.log("plupload.js: FilesAdded, count="+selected_files.length);				
 						settings.filters = value;
 					}
 
@@ -1323,10 +1358,24 @@ plupload.Uploader = function(options) {
 		}
 
 		function uploadNextChunk() {
+					
+			if (file.hasExif === false) {
+				// file.hasExif set from settings.views.thumb=1 preload (lazy) or resizeImage() 
+				// sets plupload.Uploader error in notify section 
+				// self == plupload.Uploader
+				file.status = plupload.SKIPPED;	
+				self.trigger('Error', {
+					code : plupload.IMAGE_EXIF_MISSING_ERROR,
+					message : plupload.translate('The Uploader skipped JPG files with missing Exif tags.'),
+					file : file
+				});		
+			}					
+						
+					
 			var chunkBlob, formData, args, curChunkSize;
 
 			// File upload finished
-			if (file.status == plupload.DONE || file.status == plupload.FAILED || up.state == plupload.STOPPED) {
+			if (file.status == plupload.DONE || file.status == plupload.FAILED || file.status == plupload.SKIPPED || up.state == plupload.STOPPED) {	
 				return;
 			}
 
@@ -1482,17 +1531,24 @@ plupload.Uploader = function(options) {
 		}
 
 		blob = file.getSource();
+				
+		if (o.isEmptyObj(up.settings.resize)) {
+			// force resize to preload img and check hasExif, 
+			// but don't call downsize() unless we are *really* resizing
+			up.settings.resize = {width:99999, height:99999, preserve_headers: true};
+		}
 
 		// Start uploading chunks
 		if (up.settings.resize.enabled && runtimeCan(blob, 'send_binary_string') && !!~o.inArray(blob.type, ['image/jpeg', 'image/png'])) {
 			// Resize if required
-			resizeImage.call(this, blob, up.settings.resize, function(resizedBlob) {
+			resizeImage.call(this, blob, up.settings.resize, function(resizedBlob, hasExif) {
 				blob = resizedBlob;
 				file.size = resizedBlob.size;
+				file.hasExif = hasExif; 
 				uploadNextChunk();
 			});
 		} else {
-			uploadNextChunk();
+			uploadNextChunk();	// this branch will be skipped, because we are forcing a resizeImage()
 		}
 	}
 
@@ -1539,7 +1595,14 @@ plupload.Uploader = function(options) {
 	function onError(up, err) {
 		// Set failed status if an error occured on a file
 		if (err.file) {
-			err.file.status = plupload.FAILED;
+			if (err.file.status == plupload.SKIPPED) {
+				/*
+				 * handle plupload.SKIPPED Here
+				 */
+				
+			} else 
+				err.file.status = plupload.FAILED;
+				
 			calcFile(err.file);
 
 			// Upload next file but detach it from the error event
@@ -2113,7 +2176,7 @@ plupload.File = (function() {
 			percent: 0,
 
 			/**
-			 * Status constant matching the plupload states QUEUED, UPLOADING, FAILED, DONE.
+			 * Status constant matching the plupload states QUEUED, UPLOADING, FAILED, SKIPPED, DONE.
 			 *
 			 * @property status
 			 * @type Number
@@ -2164,7 +2227,18 @@ plupload.File = (function() {
 					src.destroy();
 					delete filepool[this.id];
 				}
-			}
+			},
+			
+			/**
+			 * RelativePath from Chrome 21+ accepts folders via Drag'n'Drop,
+			 * same as this.getNative().relativePath
+			 * 		for some reason, this.getNative().webkitRelativePath==''
+			 *
+			 * @property relativePath
+			 * @type String
+			 * @see moxie.js, _readEntry()
+			 */
+			relativePath: file.getSource().relativePath || null,
 		});
 
 		filepool[this.id] = file;

@@ -1688,7 +1688,7 @@ define('moxie/core/utils/Encode', [], function() {
 		// +   improved by: Kevin van Zonneveld (http://kevin.vanzonneveld.net)
 		// +   bugfixed by: Pellentesque Malesuada
 		// +   improved by: Kevin van Zonneveld (http://kevin.vanzonneveld.net)
-		// +   improved by: Rafał Kukawski (http://kukawski.pl)
+		// +   improved by: Rafal Kukawski (http://kukawski.pl)
 		// *     example 1: base64_encode('Kevin van Zonneveld');
 		// *     returns 1: 'S2V2aW4gdmFuIFpvbm5ldmVsZA=='
 		// mozilla has this native
@@ -2625,7 +2625,19 @@ define('moxie/file/Blob', [
 			destroy: function() {
 				this.detach();
 				delete blobpool[this.uid];
-			}
+			},
+			
+			/**
+			 * RelativePath from Chrome 21+ accepts folders via Drag'n'Drop,
+			 * same as this.getSource().relativePath
+			 * TODO: check if still true:	for some reason, this.getNative().webkitRelativePath==''
+			 *
+			 * @property relativePath
+			 * @type String
+			 * @see moxie.js, _readEntry()
+			 */
+			relativePath: blob.relativePath || null,
+			
 		});
 
 		
@@ -5449,6 +5461,10 @@ define("moxie/image/Image", [
 			this.type = info.type;
 			this.meta = info.meta;
 
+			if (!this.meta.exif) {
+console.log("moxie.js: Image._updateInfo() Ideally, we want to set file.hasExif from here, but how do we access File?");				
+			}
+
 			// update file name, only if empty
 			if (this.name === '') {
 				this.name = info.name;
@@ -5469,6 +5485,7 @@ define("moxie/image/Image", [
 				}
 				// if source is o.Blob/o.File
 				else if (src instanceof Blob) {
+console.log("loadAsBlob for IMG.src="+src.relativePath);					
 					if (!~Basic.inArray(src.type, ['image/jpeg', 'image/png'])) {
 						throw new x.ImageError(x.ImageError.WRONG_FORMAT);
 					}
@@ -6120,6 +6137,9 @@ define("moxie/runtime/html5/file/FileDrop", [
 	
 	function FileDrop() {
 		var _files = [], _allowedExts = [], _options;
+		var _instance;
+		var _chunk_index = 0;
+
 
 		Basic.extend(this, {
 			init: function(options) {
@@ -6128,6 +6148,7 @@ define("moxie/runtime/html5/file/FileDrop", [
 				_options = options;
 				_allowedExts = _extractExts(_options.accept);
 				dropZone = _options.container;
+				_instance = this;	
 
 				Events.addEvent(dropZone, 'dragover', function(e) {
 					e.preventDefault();
@@ -6174,7 +6195,21 @@ define("moxie/runtime/html5/file/FileDrop", [
 			},
 
 			getFiles: function() {
-				return _files;
+				if (_options.files_added_chunksize) {
+					// up.trigger("drop") > self.bind("Drop") > FileDrop.getFiles() > self.files > uploader.addSelectedFiles(files) 
+// console.log('FileDrop.getFiles(), total count='+_files.length+', index='+(_chunk_index)+', remaining='+(_files.length-_chunk_index));
+					var _chunk = _files.slice(_chunk_index,_chunk_index+_options.files_added_chunksize);
+					_chunk_index += _chunk.length;
+					// ???: how do we get the uploader UI to show that we are still scanning FileDrop folders?
+					if ('move this somewhere else') { 
+console.warn("ScanningFiles event changed in 2.0");
+						var up = $('#uploader').plupload('getUploader'),
+							isScanning = _files.length > _chunk_index;
+						up.trigger('ScanningFiles', isScanning);
+					}
+					return _chunk;
+				} else						
+					return _files;
 			},
 
 			destroy: function() {
@@ -6212,10 +6247,26 @@ define("moxie/runtime/html5/file/FileDrop", [
 		}
 
 		function _readEntry(entry, cb) {
+			var _fullPath = entry.fullPath || null;
 			if (entry.isFile) {
 				entry.file(function(file) {
 					if (_isAcceptable(file)) {
+						// _files.push(file);
+						file.relativePath = _fullPath || null;  // expose relativePath to file
 						_files.push(file);
+						/*
+						 * add chunking to FileDrop _readEntry()
+						 */
+						if (_options.files_added_chunksize && (_files.length % _options.files_added_chunksize) == 0) {
+console.log("moxie.js: readEntry reached files_added_chunksize, _files.length="+_files.length);
+							// call drop handler, override getFiles() to limit to chunksize, continue _readEntry	
+							setTimeout(function(){
+								_instance.trigger("drop");	
+							}, 1)
+						}
+						/*
+						 *  end, FilesDrop chunking
+						 */
 					}
 					cb();
 				}, function() {
@@ -7517,6 +7568,10 @@ define("moxie/runtime/html5/image/JPEG", [
 				exif: _ep.EXIF(),
 				gps: _ep.GPS()
 			};
+		} else {
+			// check Uploader.settings.filters.require_exif===true
+			// call/trigger PluploadFile.exifMissing(), but no reference
+// console.log("moxie.js: JPEG constructor. Ideally we could set PluploadFile.hasExif from here");			
 		}
 
 		function _purge() {
@@ -8077,7 +8132,11 @@ define("moxie/runtime/html5/image/Image", [
 
 						if (_preserveHeaders) {
 							// update dimensions info in exif
-							if (_imgInfo.meta && _imgInfo.meta.exif) {
+							/*
+							 * Snappi only: preserveHeaders, but do NOT update ORIGINAL EXIF dimensions
+							 */
+							var snappi_update_exif_size = false; 
+							if (snappi_update_exif_size && _imgInfo.meta && _imgInfo.meta.exif) {
 								_imgInfo.setExif({
 									PixelXDimension: this.width,
 									PixelYDimension: this.height
